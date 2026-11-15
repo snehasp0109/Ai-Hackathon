@@ -1,0 +1,562 @@
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Random;
+
+public class MainReprocessed {
+    private static final int FEATURE_COUNT = 13;
+    private static final int DIAGNOSIS_COLUMN = 13;
+    private static final int TARGET_COLUMN = 14;
+    private static final String HEADER =
+        "age,sex,cp,trestbps,chol,fbs,restecg,thalach,exang,oldpeak,slope,ca,thal,num,target";
+    private static final String SCORED_HEADER = HEADER + ",model_score,predicted_outcome";
+
+    public static void main(String[] args) throws IOException {
+        Path input = Paths.get(args.length > 0 ? args[0] : "dataset/reprocessed.hungarian.data");
+        Path output = Paths.get(args.length > 1
+            ? args[1]
+            : "dataset/processed.reprocessed.hungarian.data");
+
+        if (input.toAbsolutePath().normalize().equals(output.toAbsolutePath().normalize())) {
+            throw new IOException("Input and output files must be different.");
+        }
+
+        // Step 1: Read the 14 Hungarian columns and treat -9 as missing.
+        List<double[]> hungarianRows = readRawHungarianData(input);
+        if (hungarianRows.isEmpty()) {
+            throw new IOException("The Hungarian file has no records.");
+        }
+
+        // Step 2: Fill missing features with medians or modes.
+        fillMissingValues(hungarianRows);
+
+        // Step 3: Write the prepared Hungarian data and binary target.
+        writePreparedData(output, hungarianRows);
+
+        // Step 4: Fit on Cleveland training data and score Hungarian records.
+        scoreHungarianData(output);
+    }
+
+    // Read one whitespace-separated 14-column Hungarian record per line.
+    private static List<double[]> readRawHungarianData(Path path) throws IOException {
+        byte[] bytes = Files.readAllBytes(path);
+        for (byte value : bytes) {
+            if (value == 0) {
+                throw new IOException("The Hungarian file contains NUL bytes.");
+            }
+        }
+
+        List<String> lines = Files.readAllLines(path, StandardCharsets.ISO_8859_1);
+        List<double[]> rows = new ArrayList<>();
+
+        for (int lineNumber = 0; lineNumber < lines.size(); lineNumber++) {
+            String line = lines.get(lineNumber).trim();
+            if (line.isEmpty()) {
+                continue;
+            }
+
+            String[] values = line.split("\\s+");
+            if (values[0].equalsIgnoreCase("age")) {
+                continue;
+            }
+            if (values.length != 14) {
+                throw new IOException("Expected 14 fields on line " + (lineNumber + 1) + ".");
+            }
+
+            double[] row = new double[14];
+            for (int column = 0; column < row.length; column++) {
+                try {
+                    row[column] = Double.parseDouble(values[column]);
+                } catch (NumberFormatException exception) {
+                    throw new IOException("Invalid number on line " + (lineNumber + 1) + ".", exception);
+                }
+                if (!Double.isFinite(row[column])) {
+                    throw new IOException("Non-finite number on line " + (lineNumber + 1) + ".");
+                }
+                if (row[column] == -9) {
+                    row[column] = Double.NaN;
+                }
+            }
+            if (Double.isNaN(row[DIAGNOSIS_COLUMN])) {
+                throw new IOException("A record is missing its diagnosis value on line "
+                    + (lineNumber + 1) + ".");
+            }
+            rows.add(row);
+        }
+        return rows;
+    }
+
+    // Use medians for continuous features and modes for categorical features.
+    private static void fillMissingValues(List<double[]> rows) throws IOException {
+        int[] continuousColumns = {0, 3, 4, 7, 9};
+        int[] categoricalColumns = {1, 2, 5, 6, 8, 10, 11, 12};
+
+        for (int column : continuousColumns) {
+            double[] values = new double[rows.size()];
+            int count = 0;
+            for (double[] row : rows) {
+                if (!Double.isNaN(row[column])) {
+                    values[count++] = row[column];
+                }
+            }
+            if (count == 0) {
+                throw new IOException("No observed values for column " + column + ".");
+            }
+
+            Arrays.sort(values, 0, count);
+            double median;
+            if (count % 2 == 1) {
+                median = values[count / 2];
+            } else {
+                median = (values[count / 2 - 1] + values[count / 2]) / 2.0;
+            }
+            replaceMissingValues(rows, column, median);
+        }
+
+        for (int column : categoricalColumns) {
+            double mode = findMode(rows, column);
+            replaceMissingValues(rows, column, mode);
+        }
+    }
+
+    // Find the most common observed value in one column.
+    private static double findMode(List<double[]> rows, int column) throws IOException {
+        double mode = Double.NaN;
+        int highestCount = 0;
+
+        for (double[] candidateRow : rows) {
+            double candidate = candidateRow[column];
+            if (Double.isNaN(candidate)) {
+                continue;
+            }
+
+            int count = 0;
+            for (double[] row : rows) {
+                if (row[column] == candidate) {
+                    count++;
+                }
+            }
+            if (count > highestCount) {
+                mode = candidate;
+                highestCount = count;
+            }
+        }
+        if (highestCount == 0) {
+            throw new IOException("No observed values for column " + column + ".");
+        }
+        return mode;
+    }
+
+    // Replace missing values in the selected column.
+    private static void replaceMissingValues(List<double[]> rows, int column, double value) {
+        for (double[] row : rows) {
+            if (Double.isNaN(row[column])) {
+                row[column] = value;
+            }
+        }
+    }
+
+    // Write the 14 source fields and derive target as 0 or 1.
+    private static void writePreparedData(Path path, List<double[]> rows) throws IOException {
+        createParentFolder(path);
+        try (BufferedWriter writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
+            writer.write(HEADER);
+            writer.newLine();
+
+            for (double[] row : rows) {
+                for (int column = 0; column < row.length; column++) {
+                    if (column > 0) {
+                        writer.write(",");
+                    }
+                    writer.write(formatNumber(row[column]));
+                }
+                writer.write(row[DIAGNOSIS_COLUMN] == 0 ? ",0" : ",1");
+                writer.newLine();
+            }
+        }
+        System.out.println("Prepared " + rows.size() + " Hungarian records in " + path);
+    }
+
+    // Fit the Cleveland model, score Hungarian rows, and calculate the metrics.
+    private static void scoreHungarianData(Path hungarianPath) throws IOException {
+        double[][] clevelandRows = readPreparedData(Paths.get("dataset/processed.cleveland.data"));
+        double[][][] split = splitData(clevelandRows);
+        double[][] trainingRows = split[0];
+
+        double[][] actualRows = readPreparedData(hungarianPath);
+        double[][] scaledRows = copyRows(actualRows);
+
+        // Use only Cleveland training means and deviations for scaling.
+        standardize(trainingRows, scaledRows);
+        double[] weights = trainLogisticRegression(trainingRows);
+
+        int truePositive = 0;
+        int trueNegative = 0;
+        int falsePositive = 0;
+        int falseNegative = 0;
+
+        // Score each Hungarian record and save its probability and label.
+        createParentFolder(hungarianPath);
+        try (BufferedWriter writer = Files.newBufferedWriter(hungarianPath, StandardCharsets.UTF_8)) {
+            writer.write(SCORED_HEADER);
+            writer.newLine();
+
+            for (int i = 0; i < actualRows.length; i++) {
+                double score = getScore(weights, scaledRows[i]);
+                double probability = sigmoid(score);
+                int predicted = probability >= 0.5 ? 1 : 0;
+                int actual = (int) actualRows[i][TARGET_COLUMN];
+
+                if (actual == 1 && predicted == 1) {
+                    truePositive++;
+                } else if (actual == 0 && predicted == 0) {
+                    trueNegative++;
+                } else if (actual == 0) {
+                    falsePositive++;
+                } else {
+                    falseNegative++;
+                }
+
+                writeScoredRow(writer, actualRows[i], probability, predicted);
+            }
+        }
+
+        printMetrics(truePositive, trueNegative, falsePositive, falseNegative);
+        writeClassOutcomeChart(
+            Paths.get("dataset/hungarian_class_outcomes.svg"),
+            trueNegative, falsePositive, falseNegative, truePositive
+        );
+        System.out.println("Class-wise chart saved to dataset/hungarian_class_outcomes.svg");
+    }
+
+    // Read a prepared CSV row containing 13 features, diagnosis, and target.
+    private static double[][] readPreparedData(Path path) throws IOException {
+        List<double[]> rows = new ArrayList<>();
+        try (BufferedReader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+            String header = reader.readLine();
+            if (header == null || !header.endsWith(",num,target")) {
+                throw new IOException("Unexpected dataset header in " + path);
+            }
+
+            String line;
+            int lineNumber = 1;
+            while ((line = reader.readLine()) != null) {
+                lineNumber++;
+                if (line.trim().isEmpty()) {
+                    continue;
+                }
+
+                String[] values = line.split(",", -1);
+                if (values.length != 15) {
+                    throw new IOException("Expected 15 columns on line " + lineNumber + " in " + path);
+                }
+
+                double[] row = new double[15];
+                for (int column = 0; column < row.length; column++) {
+                    try {
+                        row[column] = Double.parseDouble(values[column].trim());
+                    } catch (NumberFormatException exception) {
+                        throw new IOException("Invalid number on line " + lineNumber + " in " + path, exception);
+                    }
+                }
+                rows.add(row);
+            }
+        }
+        if (rows.isEmpty()) {
+            throw new IOException("No records found in " + path);
+        }
+        return rows.toArray(new double[rows.size()][]);
+    }
+
+    // Copy rows so the original Hungarian values remain available for output.
+    private static double[][] copyRows(double[][] rows) {
+        double[][] copy = new double[rows.length][];
+        for (int i = 0; i < rows.length; i++) {
+            copy[i] = rows[i].clone();
+        }
+        return copy;
+    }
+
+    // Standardize both datasets using Cleveland training statistics.
+    private static void standardize(double[][] trainingRows, double[][] newRows) {
+        double[] means = new double[FEATURE_COUNT];
+        double[] deviations = new double[FEATURE_COUNT];
+
+        for (double[] row : trainingRows) {
+            for (int feature = 0; feature < FEATURE_COUNT; feature++) {
+                means[feature] += row[feature];
+            }
+        }
+        for (int feature = 0; feature < FEATURE_COUNT; feature++) {
+            means[feature] /= trainingRows.length;
+        }
+
+        for (double[] row : trainingRows) {
+            for (int feature = 0; feature < FEATURE_COUNT; feature++) {
+                double difference = row[feature] - means[feature];
+                deviations[feature] += difference * difference;
+            }
+        }
+        for (int feature = 0; feature < FEATURE_COUNT; feature++) {
+            deviations[feature] = Math.sqrt(deviations[feature] / trainingRows.length);
+            if (deviations[feature] == 0) {
+                deviations[feature] = 1;
+            }
+        }
+
+        scaleRows(trainingRows, means, deviations);
+        scaleRows(newRows, means, deviations);
+    }
+
+    // Apply the Cleveland means and deviations to feature columns.
+    private static void scaleRows(double[][] rows, double[] means, double[] deviations) {
+        for (double[] row : rows) {
+            for (int feature = 0; feature < FEATURE_COUNT; feature++) {
+                row[feature] = (row[feature] - means[feature]) / deviations[feature];
+            }
+        }
+    }
+
+    // Train logistic regression on the Cleveland training split.
+    private static double[] trainLogisticRegression(double[][] rows) {
+        int epochs = 3000;
+        double learningRate = 0.1;
+        double regularization = 0.01;
+        double[] weights = new double[FEATURE_COUNT + 1];
+
+        for (int epoch = 0; epoch < epochs; epoch++) {
+            double[] gradients = new double[weights.length];
+            for (double[] row : rows) {
+                double error = sigmoid(getScore(weights, row)) - row[TARGET_COLUMN];
+                for (int feature = 0; feature < FEATURE_COUNT; feature++) {
+                    gradients[feature] += error * row[feature];
+                }
+                gradients[FEATURE_COUNT] += error;
+            }
+
+            for (int feature = 0; feature < FEATURE_COUNT; feature++) {
+                double average = gradients[feature] / rows.length;
+                weights[feature] -= learningRate
+                    * (average + regularization * weights[feature]);
+            }
+            weights[FEATURE_COUNT] -= learningRate * gradients[FEATURE_COUNT] / rows.length;
+        }
+        return weights;
+    }
+
+    // Calculate the weighted feature sum plus the model intercept.
+    private static double getScore(double[] weights, double[] row) {
+        double score = weights[FEATURE_COUNT];
+        for (int feature = 0; feature < FEATURE_COUNT; feature++) {
+            score += weights[feature] * row[feature];
+        }
+        return score;
+    }
+
+    // Convert a model score into a probability.
+    private static double sigmoid(double score) {
+        return 1.0 / (1.0 + Math.exp(-score));
+    }
+
+    // Make the same stratified 80/20 split used by ModelEvaluation.
+    private static double[][][] splitData(double[][] rows) throws IOException {
+        List<double[]> classZero = new ArrayList<>();
+        List<double[]> classOne = new ArrayList<>();
+        for (double[] row : rows) {
+            if (row[TARGET_COLUMN] == 0) {
+                classZero.add(row);
+            } else {
+                classOne.add(row);
+            }
+        }
+        if (classZero.size() < 2 || classOne.size() < 2) {
+            throw new IOException("Cleveland data needs at least two records per target class.");
+        }
+
+        Random random = new Random(42);
+        Collections.shuffle(classZero, random);
+        Collections.shuffle(classOne, random);
+
+        int zeroTestSize = getTestSize(classZero.size());
+        int oneTestSize = getTestSize(classOne.size());
+        double[][] training = new double[rows.length - zeroTestSize - oneTestSize][];
+        double[][] test = new double[zeroTestSize + oneTestSize][];
+        int trainingIndex = 0;
+        int testIndex = 0;
+
+        trainingIndex = addClassToSplit(classZero, zeroTestSize, training, test,
+            trainingIndex, testIndex);
+        testIndex = zeroTestSize;
+        addClassToSplit(classOne, oneTestSize, training, test, trainingIndex, testIndex);
+
+        Collections.shuffle(Arrays.asList(training), random);
+        Collections.shuffle(Arrays.asList(test), random);
+        return new double[][][] {training, test};
+    }
+
+    // Put the first testSize rows in test and the rest in training.
+    private static int addClassToSplit(
+        List<double[]> rows,
+        int testSize,
+        double[][] training,
+        double[][] test,
+        int trainingIndex,
+        int testIndex
+    ) {
+        for (int i = 0; i < rows.size(); i++) {
+            if (i < testSize) {
+                test[testIndex++] = rows.get(i);
+            } else {
+                training[trainingIndex++] = rows.get(i);
+            }
+        }
+        return trainingIndex;
+    }
+
+    // Keep at least one example of each class in both split parts.
+    private static int getTestSize(int classSize) {
+        int size = (int) Math.round(classSize * 0.20);
+        return Math.max(1, Math.min(classSize - 1, size));
+    }
+
+    // Print the four requested evaluation metrics.
+    private static void printMetrics(int tp, int tn, int fp, int fn) {
+        int total = tp + tn + fp + fn;
+        System.out.printf("Accuracy: %.4f%n", (tp + tn) / (double) total);
+        System.out.printf("Precision: %.4f%n", ratio(tp, tp + fp));
+        System.out.printf("Sensitivity: %.4f%n", ratio(tp, tp + fn));
+        System.out.printf("Specificity: %.4f%n", ratio(tn, tn + fp));
+    }
+
+    // Avoid dividing by zero when a class has no predicted or actual examples.
+    private static double ratio(int numerator, int denominator) {
+        return denominator == 0 ? 0 : numerator / (double) denominator;
+    }
+
+    // Write one row of prepared features, probability, and predicted label.
+    private static void writeScoredRow(
+        BufferedWriter writer,
+        double[] row,
+        double probability,
+        int predicted
+    ) throws IOException {
+        for (int column = 0; column < row.length; column++) {
+            if (column > 0) {
+                writer.write(",");
+            }
+            writer.write(formatNumber(row[column]));
+        }
+        writer.write("," + String.format(java.util.Locale.ROOT, "%.12f", probability));
+        writer.write("," + predicted);
+        writer.newLine();
+    }
+
+    // Plot correct and incorrect predictions as 100% bars for each actual class.
+    private static void writeClassOutcomeChart(
+        Path path,
+        int trueNegative,
+        int falsePositive,
+        int falseNegative,
+        int truePositive
+    ) throws IOException {
+        int width = 900;
+        int height = 390;
+        int left = 230;
+        int top = 120;
+        int barWidth = 570;
+        int barHeight = 64;
+        int rowGap = 95;
+
+        int[] correct = {trueNegative, truePositive};
+        int[] incorrect = {falsePositive, falseNegative};
+        String[] classes = {"Actual outcome 0", "Actual outcome 1"};
+
+        StringBuilder svg = new StringBuilder();
+        svg.append("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"").append(width)
+            .append("\" height=\"").append(height).append("\">\n")
+            .append("<rect width=\"100%\" height=\"100%\" fill=\"white\"/>\n")
+            .append("<text x=\"450\" y=\"35\" text-anchor=\"middle\" font-size=\"20\">Prediction results by actual class</text>\n")
+            .append("<text x=\"450\" y=\"60\" text-anchor=\"middle\" font-size=\"13\">Each bar shows the share of records within its actual class</text>\n")
+            .append("<rect x=\"285\" y=\"75\" width=\"14\" height=\"14\" fill=\"#16a34a\"/>\n")
+            .append("<text x=\"305\" y=\"87\" font-size=\"12\">Correct</text>\n")
+            .append("<rect x=\"380\" y=\"75\" width=\"14\" height=\"14\" fill=\"#dc2626\"/>\n")
+            .append("<text x=\"400\" y=\"87\" font-size=\"12\">Incorrect</text>\n");
+
+        for (int tick = 0; tick <= 4; tick++) {
+            int x = left + tick * barWidth / 4;
+            svg.append("<line x1=\"").append(x).append("\" y1=\"110\" x2=\"")
+                .append(x).append("\" y2=\"289\" stroke=\"#ddd\"/>\n")
+                .append("<text x=\"").append(x).append("\" y=\"102\" text-anchor=\"middle\">")
+                .append(tick * 25).append("%</text>\n");
+        }
+
+        for (int row = 0; row < 2; row++) {
+            int y = top + row * rowGap;
+            int total = correct[row] + incorrect[row];
+            double correctShare = ratio(correct[row], total);
+            int correctWidth = (int) Math.round(correctShare * barWidth);
+            int incorrectWidth = barWidth - correctWidth;
+
+            svg.append("<text x=\"").append(left - 14).append("\" y=\"").append(y + 37)
+                .append("\" text-anchor=\"end\">").append(classes[row]).append("</text>\n")
+                .append("<rect x=\"").append(left).append("\" y=\"").append(y)
+                .append("\" width=\"").append(correctWidth).append("\" height=\"").append(barHeight)
+                .append("\" fill=\"#16a34a\"/>\n")
+                .append("<rect x=\"").append(left + correctWidth).append("\" y=\"").append(y)
+                .append("\" width=\"").append(incorrectWidth).append("\" height=\"").append(barHeight)
+                .append("\" fill=\"#dc2626\"/>\n");
+
+            writeBarLabel(svg, left, y, correctWidth, correct[row], correctShare);
+            writeBarLabel(svg, left + correctWidth, y, incorrectWidth, incorrect[row],
+                ratio(incorrect[row], total));
+        }
+
+        svg.append("<text x=\"515\" y=\"355\" text-anchor=\"middle\">Share of actual class</text>\n")
+            .append("</svg>\n");
+        createParentFolder(path);
+        Files.write(path, svg.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    // Label each visible chart segment with its count and percentage.
+    private static void writeBarLabel(
+        StringBuilder svg,
+        int x,
+        int y,
+        int width,
+        int count,
+        double share
+    ) {
+        if (width < 50) {
+            return;
+        }
+        svg.append("<text x=\"").append(x + width / 2).append("\" y=\"").append(y + 27)
+            .append("\" text-anchor=\"middle\" font-size=\"13\" fill=\"white\">")
+            .append(count).append(" (")
+            .append(String.format(java.util.Locale.ROOT, "%.1f%%", share * 100))
+            .append(")</text>\n");
+    }
+
+    // Create output folders when needed.
+    private static void createParentFolder(Path path) throws IOException {
+        Path parent = path.toAbsolutePath().normalize().getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+    }
+
+    // Write integers without a decimal part and keep decimals unchanged.
+    private static String formatNumber(double value) {
+        if (Math.rint(value) == value) {
+            return Long.toString((long) value);
+        }
+        return Double.toString(value);
+    }
+}

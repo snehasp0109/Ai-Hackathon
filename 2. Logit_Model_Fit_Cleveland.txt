@@ -1,0 +1,558 @@
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Random;
+
+public class ModelEvaluation {
+    private static final int FEATURE_COUNT = 13;
+    private static final int LABEL_COLUMN = 14;
+    private static final int LABEL_INDEX = FEATURE_COUNT;
+    private static final int SOURCE_LINE_INDEX = FEATURE_COUNT + 1;
+    private static final double TEST_FRACTION = 0.20;
+    private static final long RANDOM_SEED = 42;
+    private static final String[] FEATURE_NAMES = {
+        "age", "sex", "cp", "trestbps", "chol", "fbs", "restecg",
+        "thalach", "exang", "oldpeak", "slope", "ca", "thal"
+    };
+
+    private static final class EvaluationResult {
+        final double[][] train;
+        final double[][] test;
+        final double[] weights;
+        final int baselineClass;
+        final int[] actualTargets;
+        final double[] modelScores;
+        int correctModelPredictions;
+        int correctBaselinePredictions;
+
+        EvaluationResult(double[][] train, double[][] test, double[] weights, int baselineClass) {
+            this.train = train;
+            this.test = test;
+            this.weights = weights;
+            this.baselineClass = baselineClass;
+            this.actualTargets = new int[test.length];
+            this.modelScores = new double[test.length];
+        }
+    }
+
+    public static void main(String[] args) throws IOException {
+        // Step 1: Get the input data and chart paths.
+        Path dataPath = Paths.get(args.length > 0 ? args[0] : "dataset/processed.cleveland.data");
+        Path chartPath = Paths.get(args.length > 1 ? args[1] : "target_predictions.svg");
+
+        // Step 2: Fit and test the model, then show its results.
+        EvaluationResult result = evaluateData(dataPath);
+        printSummary(result);
+        printMistakes(result.test, result.weights);
+
+        // Step 3: Save class-wise correct/incorrect results for train and test.
+        writeChart(chartPath, result.train, result.test, result.weights);
+        System.out.println("Class-wise train/test chart saved to " + chartPath);
+
+        // Step 4: Add each record's model score and predicted outcome to the CSV.
+        writePredictions(dataPath, result);
+        System.out.println("Model scores and predicted outcomes saved to " + dataPath);
+    }
+
+    private static EvaluationResult evaluateData(Path dataPath) throws IOException {
+        // Step 1: Read data, split it, and standardize from training values.
+        double[][] allRows = readRows(dataPath);
+        double[][][] split = splitData(allRows);
+        double[][] train = split[0];
+        double[][] test = split[1];
+        standardize(train, test);
+
+        // Step 2: Fit the model using only training rows.
+        double[] weights = trainLogisticRegression(train);
+        int baselineClass = findBaselineClass(train);
+        EvaluationResult result = new EvaluationResult(train, test, weights, baselineClass);
+
+        // Step 3: Predict test rows and count correct results.
+        for (int i = 0; i < test.length; i++) {
+            result.actualTargets[i] = (int) test[i][LABEL_INDEX];
+            result.modelScores[i] = getScore(weights, test[i]);
+            int prediction = predict(result.modelScores[i]);
+
+            if (prediction == result.actualTargets[i]) {
+                result.correctModelPredictions++;
+            }
+            if (baselineClass == result.actualTargets[i]) {
+                result.correctBaselinePredictions++;
+            }
+        }
+        return result;
+    }
+
+    private static void printSummary(EvaluationResult result) {
+        System.out.printf("Split: %d training, %d test (80%% / 20%%)%n",
+            result.train.length, result.test.length);
+        System.out.printf("Logistic regression accuracy: %.3f%n",
+            (double) result.correctModelPredictions / result.test.length);
+        System.out.printf("Majority-class baseline (predict %d) accuracy: %.3f%n",
+            result.baselineClass, (double) result.correctBaselinePredictions / result.test.length);
+    }
+
+    private static int findBaselineClass(double[][] train) {
+        int positiveCount = 0;
+        for (double[] row : train) {
+            positiveCount += (int) row[LABEL_INDEX];
+        }
+        return positiveCount > train.length / 2 ? 1 : 0;
+    }
+
+    private static int predict(double score) {
+        return sigmoid(score) >= 0.5 ? 1 : 0;
+    }
+
+    // Read the 13 features and target; do not use the "num" column.
+    private static double[][] readRows(Path path) throws IOException {
+        List<double[]> rows = new ArrayList<>();
+        try (BufferedReader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+            String header = reader.readLine();
+            if (header == null
+                || !(header.endsWith(",num,target")
+                    || header.endsWith(",num,target,model_score,predicted_outcome"))) {
+                throw new IOException("Unexpected dataset header in " + path);
+            }
+
+            String line;
+            int lineNumber = 1;
+            while ((line = reader.readLine()) != null) {
+                lineNumber++;
+                if (line.trim().isEmpty()) {
+                    continue;
+                }
+
+                String[] values = line.split(",", -1);
+                if (values.length != LABEL_COLUMN + 1 && values.length != LABEL_COLUMN + 3) {
+                    throw new IOException("Expected 15 columns at line " + lineNumber + ".");
+                }
+
+                double[] row = new double[FEATURE_COUNT + 2];
+                for (int feature = 0; feature < FEATURE_COUNT; feature++) {
+                    row[feature] = Double.parseDouble(values[feature].trim());
+                    if (!Double.isFinite(row[feature])) {
+                        throw new IOException("Non-finite feature at line " + lineNumber + ".");
+                    }
+                }
+
+                try {
+                    row[LABEL_INDEX] = Integer.parseInt(values[LABEL_COLUMN].trim());
+                } catch (NumberFormatException exception) {
+                    throw new IOException("Invalid target at line " + lineNumber + ".", exception);
+                }
+                if (row[LABEL_INDEX] != 0 && row[LABEL_INDEX] != 1) {
+                    throw new IOException("Target must be 0 or 1 at line " + lineNumber + ".");
+                }
+                row[SOURCE_LINE_INDEX] = lineNumber;
+                rows.add(row);
+            }
+        } catch (NumberFormatException exception) {
+            throw new IOException("A feature value is not a number in " + path + ".", exception);
+        }
+
+        if (rows.isEmpty()) {
+            throw new IOException("Dataset has no records: " + path);
+        }
+        return rows.toArray(new double[rows.size()][]);
+    }
+
+    // Split each class separately so both classes occur in train and test sets.
+    private static double[][][] splitData(double[][] rows) throws IOException {
+        // Step 1: Group rows by target.
+        List<double[]> classZero = new ArrayList<>();
+        List<double[]> classOne = new ArrayList<>();
+        for (double[] row : rows) {
+            if (row[LABEL_INDEX] == 0) {
+                classZero.add(row);
+            } else {
+                classOne.add(row);
+            }
+        }
+
+        if (classZero.size() < 2 || classOne.size() < 2) {
+            throw new IOException("Each target class needs at least two records.");
+        }
+
+        // Step 2: Shuffle each group with a fixed seed for repeatable results.
+        Random random = new Random(RANDOM_SEED);
+        Collections.shuffle(classZero, random);
+        Collections.shuffle(classOne, random);
+
+        // Step 3: Put 20% of each group in the test set.
+        int zeroTestSize = getTestSize(classZero.size());
+        int oneTestSize = getTestSize(classOne.size());
+        double[][] train = new double[rows.length - zeroTestSize - oneTestSize][];
+        double[][] test = new double[zeroTestSize + oneTestSize][];
+
+        int trainIndex = 0;
+        int testIndex = 0;
+        for (int i = 0; i < classZero.size(); i++) {
+            if (i < zeroTestSize) {
+                test[testIndex++] = classZero.get(i);
+            } else {
+                train[trainIndex++] = classZero.get(i);
+            }
+        }
+        for (int i = 0; i < classOne.size(); i++) {
+            if (i < oneTestSize) {
+                test[testIndex++] = classOne.get(i);
+            } else {
+                train[trainIndex++] = classOne.get(i);
+            }
+        }
+
+        // Step 4: Shuffle both finished sets.
+        shuffleRows(train, random);
+        shuffleRows(test, random);
+        return new double[][][] {train, test};
+    }
+
+    // Keep at least one record of each class in both parts of the split.
+    private static int getTestSize(int classSize) {
+        int size = (int) Math.round(classSize * TEST_FRACTION);
+        return Math.max(1, Math.min(classSize - 1, size));
+    }
+
+    // Shuffle rows with the Fisher-Yates method.
+    private static void shuffleRows(double[][] rows, Random random) {
+        for (int i = rows.length - 1; i > 0; i--) {
+            int otherIndex = random.nextInt(i + 1);
+            double[] temporary = rows[i];
+            rows[i] = rows[otherIndex];
+            rows[otherIndex] = temporary;
+        }
+    }
+
+    // Standardize both sets using only training-set statistics.
+    private static void standardize(double[][] train, double[][] test) {
+        // Step 1: Find each feature's training mean.
+        double[] means = new double[FEATURE_COUNT];
+        double[] deviations = new double[FEATURE_COUNT];
+
+        // Step 2: Find each feature's training standard deviation.
+        for (double[] row : train) {
+            for (int feature = 0; feature < FEATURE_COUNT; feature++) {
+                means[feature] += row[feature];
+            }
+        }
+        for (int feature = 0; feature < FEATURE_COUNT; feature++) {
+            means[feature] /= train.length;
+        }
+        for (double[] row : train) {
+            for (int feature = 0; feature < FEATURE_COUNT; feature++) {
+                double difference = row[feature] - means[feature];
+                deviations[feature] += difference * difference;
+            }
+        }
+        for (int feature = 0; feature < FEATURE_COUNT; feature++) {
+            deviations[feature] = Math.sqrt(deviations[feature] / train.length);
+            if (deviations[feature] == 0) {
+                deviations[feature] = 1;
+            }
+        }
+
+        // Step 3: Apply the same training scale to both sets.
+        scaleRows(train, means, deviations);
+        scaleRows(test, means, deviations);
+    }
+
+    private static void scaleRows(double[][] rows, double[] means, double[] deviations) {
+        for (double[] row : rows) {
+            for (int feature = 0; feature < FEATURE_COUNT; feature++) {
+                row[feature] = (row[feature] - means[feature]) / deviations[feature];
+            }
+        }
+    }
+
+    // Fit logistic regression by repeatedly updating weights on the training rows.
+    private static double[] trainLogisticRegression(double[][] rows) {
+        int epochs = 3000;
+        double learningRate = 0.1;
+        double regularization = 0.01;
+        double[] weights = new double[FEATURE_COUNT + 1];
+
+        // Repeat gradient updates for the configured number of epochs.
+        for (int epoch = 0; epoch < epochs; epoch++) {
+            double[] gradients = new double[weights.length];
+            for (double[] row : rows) {
+                double error = sigmoid(getScore(weights, row)) - row[LABEL_INDEX];
+                for (int feature = 0; feature < FEATURE_COUNT; feature++) {
+                    gradients[feature] += error * row[feature];
+                }
+                gradients[FEATURE_COUNT] += error;
+            }
+
+            for (int feature = 0; feature < FEATURE_COUNT; feature++) {
+                double averageGradient = gradients[feature] / rows.length;
+                weights[feature] -= learningRate
+                    * (averageGradient + regularization * weights[feature]);
+            }
+            weights[FEATURE_COUNT] -= learningRate * gradients[FEATURE_COUNT] / rows.length;
+        }
+        return weights;
+    }
+
+    // Add each weighted feature and the model intercept to get the score.
+    private static double getScore(double[] weights, double[] row) {
+        double score = weights[FEATURE_COUNT];
+        for (int feature = 0; feature < FEATURE_COUNT; feature++) {
+            score += weights[feature] * row[feature];
+        }
+        return score;
+    }
+
+    // Convert the score to a probability between zero and one.
+    private static double sigmoid(double score) {
+        return 1.0 / (1.0 + Math.exp(-score));
+    }
+
+    // Show each mistake and the strongest feature pushes toward either class.
+    private static void printMistakes(double[][] test, double[] weights) {
+        int mistakes = 0;
+        for (double[] row : test) {
+            int prediction = predict(getScore(weights, row));
+            if (prediction != (int) row[LABEL_INDEX]) {
+                mistakes++;
+            }
+        }
+        System.out.println("Misclassified test cases: " + mistakes);
+
+        for (double[] row : test) {
+            double score = getScore(weights, row);
+            double probability = sigmoid(score);
+            int prediction = predict(score);
+            int actual = (int) row[LABEL_INDEX];
+            if (prediction == actual) {
+                continue;
+            }
+
+            int strongestPositive = strongestFeatureIndex(weights, row, true);
+            int strongestNegative = strongestFeatureIndex(weights, row, false);
+            double strongestPositiveContribution = weights[strongestPositive] * row[strongestPositive];
+            double strongestNegativeContribution = weights[strongestNegative] * row[strongestNegative];
+
+            System.out.printf("  CSV line %.0f: actual=%d, predicted=%d, probability=%.3f%n",
+                row[SOURCE_LINE_INDEX], actual, prediction, probability);
+            System.out.printf("    Toward 1: %s (%+.3f); toward 0: %s (%+.3f)%n",
+                FEATURE_NAMES[strongestPositive], strongestPositiveContribution,
+                FEATURE_NAMES[strongestNegative], strongestNegativeContribution);
+        }
+    }
+
+    private static int strongestFeatureIndex(double[] weights, double[] row, boolean towardPositiveClass) {
+        int strongestFeature = 0;
+        double strongestContribution = towardPositiveClass ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY;
+        for (int feature = 0; feature < FEATURE_COUNT; feature++) {
+            double contribution = weights[feature] * row[feature];
+            if ((towardPositiveClass && contribution > strongestContribution)
+                || (!towardPositiveClass && contribution < strongestContribution)) {
+                strongestContribution = contribution;
+                strongestFeature = feature;
+            }
+        }
+        return strongestFeature;
+    }
+
+    // Plot the share of correct and incorrect predictions for each actual class.
+    private static void writeChart(
+        Path path,
+        double[][] train,
+        double[][] test,
+        double[] weights
+    ) throws IOException {
+        int width = 800;
+        int height = 430;
+        int left = 220;
+        int top = 130;
+        int barWidth = 520;
+        int barHeight = 48;
+        int rowGap = 65;
+        int[][][] counts = new int[2][2][2];
+
+        // Calculate each row's score and predicted outcome, grouped by split and actual class.
+        countPredictions(train, weights, counts[0]);
+        countPredictions(test, weights, counts[1]);
+
+        StringBuilder svg = new StringBuilder();
+        svg.append("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"").append(width)
+            .append("\" height=\"").append(height).append("\">\n")
+            .append("<rect width=\"100%\" height=\"100%\" fill=\"white\"/>\n")
+            .append("<text x=\"400\" y=\"30\" text-anchor=\"middle\" font-size=\"19\">Correct and incorrect predictions</text>\n")
+            .append("<text x=\"400\" y=\"55\" text-anchor=\"middle\" font-size=\"13\">100% bars grouped by actual class</text>\n")
+            .append("<rect x=\"320\" y=\"75\" width=\"14\" height=\"14\" fill=\"#16a34a\"/>\n")
+            .append("<text x=\"340\" y=\"87\" font-size=\"12\">Correct</text>\n")
+            .append("<rect x=\"410\" y=\"75\" width=\"14\" height=\"14\" fill=\"#dc2626\"/>\n")
+            .append("<text x=\"430\" y=\"87\" font-size=\"12\">Incorrect</text>\n");
+
+        // Mark the 0%, 25%, 50%, 75%, and 100% positions.
+        for (int tick = 0; tick <= 4; tick++) {
+            int x = left + tick * barWidth / 4;
+            svg.append("<line x1=\"").append(x).append("\" y1=\"").append(top - 20)
+                .append("\" x2=\"").append(x).append("\" y2=\"").append(top + 4 * rowGap - 14)
+                .append("\" stroke=\"#ddd\"/>\n")
+                .append("<text x=\"").append(x).append("\" y=\"").append(top - 28)
+                .append("\" text-anchor=\"middle\" font-size=\"12\">").append(tick * 25)
+                .append("%</text>\n");
+        }
+
+        // Draw two class bars for training and two for testing.
+        String[] splitNames = {"Train", "Test"};
+        int bar = 0;
+        for (int split = 0; split < 2; split++) {
+            for (int actual = 0; actual <= 1; actual++) {
+                int y = top + bar * rowGap;
+                int correct = counts[split][actual][0];
+                int incorrect = counts[split][actual][1];
+                int total = correct + incorrect;
+                double correctShare = total == 0 ? 0 : correct / (double) total;
+                int correctWidth = (int) Math.round(correctShare * barWidth);
+                int incorrectWidth = barWidth - correctWidth;
+
+                svg.append("<text x=\"").append(left - 14).append("\" y=\"").append(y + 29)
+                    .append("\" text-anchor=\"end\" font-size=\"13\">")
+                    .append(splitNames[split]).append(", actual ").append(actual)
+                    .append("</text>\n")
+                    .append("<rect x=\"").append(left).append("\" y=\"").append(y)
+                    .append("\" width=\"").append(correctWidth).append("\" height=\"").append(barHeight)
+                    .append("\" fill=\"#16a34a\"/>\n")
+                    .append("<rect x=\"").append(left + correctWidth).append("\" y=\"").append(y)
+                    .append("\" width=\"").append(incorrectWidth).append("\" height=\"").append(barHeight)
+                    .append("\" fill=\"#dc2626\"/>\n");
+                appendChartSegment(svg, left, y, correctWidth, correct, total);
+                appendChartSegment(svg, left + correctWidth, y, incorrectWidth, incorrect, total);
+                bar++;
+            }
+        }
+
+        svg.append("<text x=\"480\" y=\"405\" text-anchor=\"middle\" font-size=\"13\">Share of actual class</text>\n")
+            .append("</svg>\n");
+
+        Path parent = path.toAbsolutePath().normalize().getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        try (BufferedWriter writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
+            writer.write(svg.toString());
+        }
+    }
+
+    // Use each model score to get a thresholded outcome and count right or wrong.
+    private static void countPredictions(double[][] rows, double[] weights, int[][] counts) {
+        for (double[] row : rows) {
+            double modelScore = getScore(weights, row);
+            int predictedOutcome = predict(modelScore);
+            int actualOutcome = (int) row[LABEL_INDEX];
+            int result = predictedOutcome == actualOutcome ? 0 : 1;
+            counts[actualOutcome][result]++;
+        }
+    }
+
+    // Label each visible chart segment with its count and share of the class.
+    private static void appendChartSegment(
+        StringBuilder svg,
+        int x,
+        int y,
+        int width,
+        int count,
+        int total
+    ) {
+        if (width < 55 || total == 0) {
+            return;
+        }
+        double percentage = count * 100.0 / total;
+        svg.append("<text x=\"").append(x + width / 2).append("\" y=\"").append(y + 28)
+            .append("\" text-anchor=\"middle\" font-size=\"12\" fill=\"white\">")
+            .append(count).append(" (").append(String.format(Locale.ROOT, "%.1f%%", percentage))
+            .append(")</text>\n");
+    }
+
+    // Apply the fitted model to all records and append score and prediction columns.
+    private static void writePredictions(Path path, EvaluationResult result) throws IOException {
+        Map<Integer, String> predictionsByLine = new HashMap<>();
+        addPredictions(result.train, result.weights, predictionsByLine);
+        addPredictions(result.test, result.weights, predictionsByLine);
+
+        List<String> inputLines = Files.readAllLines(path, StandardCharsets.UTF_8);
+        if (inputLines.isEmpty()) {
+            throw new IOException("Dataset has no header: " + path);
+        }
+
+        Path parent = path.toAbsolutePath().normalize().getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        try (BufferedWriter writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
+            writer.write("age,sex,cp,trestbps,chol,fbs,restecg,thalach,exang,oldpeak,"
+                + "slope,ca,thal,num,target,model_score,predicted_outcome");
+            writer.newLine();
+
+            for (int i = 1; i < inputLines.size(); i++) {
+                String line = inputLines.get(i);
+                if (line.trim().isEmpty()) {
+                    writer.newLine();
+                    continue;
+                }
+
+                String[] columns = line.split(",", -1);
+                if (columns.length < LABEL_COLUMN + 1) {
+                    throw new IOException("Expected at least 15 columns at line " + (i + 1) + ".");
+                }
+                String prediction = predictionsByLine.get(i + 1);
+                if (prediction == null) {
+                    throw new IOException("No model prediction for line " + (i + 1) + ".");
+                }
+                for (int column = 0; column <= LABEL_COLUMN; column++) {
+                    if (column > 0) {
+                        writer.write(",");
+                    }
+                    writer.write(columns[column]);
+                }
+                writer.write(",");
+                writer.write(prediction);
+                writer.newLine();
+            }
+        }
+    }
+
+    // Save the model score and thresholded outcome for each original CSV line.
+    private static void addPredictions(
+        double[][] rows,
+        double[] weights,
+        Map<Integer, String> predictionsByLine
+    ) {
+        for (double[] row : rows) {
+            double modelScore = getScore(weights, row);
+            int predictedOutcome = predict(modelScore);
+            int sourceLine = (int) row[SOURCE_LINE_INDEX];
+            predictionsByLine.put(sourceLine, String.format(
+                Locale.ROOT, "%.12f,%d", modelScore, predictedOutcome
+            ));
+        }
+    }
+}
+
+/*
+ * Fitted equation for the current Cleveland training split (seed 42).
+ * Each z_feature = (feature - training mean) / training standard deviation.
+ *
+ * score = -0.1363689233
+ *       - 0.0548773034*z_age + 0.4915015059*z_sex + 0.4868555446*z_cp
+ *       + 0.3968681996*z_trestbps + 0.2149074157*z_chol - 0.1651445217*z_fbs
+ *       + 0.3624902685*z_restecg - 0.4319586846*z_thalach
+ *       + 0.5104761080*z_exang + 0.2708424537*z_oldpeak
+ *       + 0.3060460228*z_slope + 0.8767120891*z_ca + 0.5909562827*z_thal
+ *
+ * probability = 1 / (1 + e^(-score))
+ * predict target 1 when probability >= 0.5; otherwise predict 0.
+ */

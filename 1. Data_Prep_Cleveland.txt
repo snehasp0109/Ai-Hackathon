@@ -1,0 +1,190 @@
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Scanner;
+
+public class Main {
+    private static final int[] SOURCE_COLUMNS = {
+        2, 3, 8, 9, 11, 15, 18, 31, 37, 39, 40, 43, 50, 57
+    };
+    private static final int[] CONTINUOUS_COLUMNS = {0, 3, 4, 7, 9};
+    private static final int[] CATEGORICAL_COLUMNS = {1, 2, 5, 6, 8, 10, 11, 12};
+    private static final String HEADER =
+        "age,sex,cp,trestbps,chol,fbs,restecg,thalach,exang,oldpeak,slope,ca,thal,num,target";
+
+    public static void main(String[] args) throws IOException {
+        // Step 1: Choose input and output paths.
+        Path input = Paths.get(args.length > 0 ? args[0] : "dataset/cleveland.data");
+        Path output = Paths.get(args.length > 1
+            ? args[1]
+            : "dataset/processed.cleveland.data");
+
+        if (input.toAbsolutePath().normalize().equals(output.toAbsolutePath().normalize())) {
+            throw new IOException("Input and output files must be different.");
+        }
+
+        // Step 2: Read Cleveland records and keep the 14 required fields.
+        List<double[]> rows = readRows(input);
+        if (rows.isEmpty()) {
+            throw new IOException("The raw file has no records.");
+        }
+
+        // Step 3: Fill missing feature values.
+        fillMissingValues(rows);
+
+        // Step 4: Write the data and the binary target column.
+        writeRows(output, rows);
+        System.out.println("Prepared " + rows.size() + " records in " + output);
+    }
+
+    // Read each 76-field record; "name" marks the end of a record.
+    private static List<double[]> readRows(Path input) throws IOException {
+        byte[] bytes = Files.readAllBytes(input);
+        for (byte value : bytes) {
+            if (value == 0) {
+                throw new IOException("The raw Cleveland file contains NUL bytes and appears damaged.");
+            }
+        }
+
+        String rawData = new String(bytes, StandardCharsets.ISO_8859_1);
+        List<double[]> rows = new ArrayList<>();
+        List<String> record = new ArrayList<>();
+
+        try (Scanner scanner = new Scanner(rawData)) {
+            while (scanner.hasNext()) {
+                String value = scanner.next();
+                if (value.equals("name")) {
+                    if (record.size() != 75) {
+                        throw new IOException("A raw record does not have 75 numeric fields before 'name'.");
+                    }
+
+                    // Copy the needed columns and mark -9 values as missing.
+                    double[] row = new double[SOURCE_COLUMNS.length];
+                    for (int i = 0; i < SOURCE_COLUMNS.length; i++) {
+                        double number = Double.parseDouble(record.get(SOURCE_COLUMNS[i]));
+                        row[i] = number == -9 ? Double.NaN : number;
+                    }
+                    if (Double.isNaN(row[13])) {
+                        throw new IOException("A record is missing its num diagnosis value.");
+                    }
+                    rows.add(row);
+                    record.clear();
+                } else {
+                    record.add(value);
+                    if (record.size() > 75) {
+                        throw new IOException("A raw record has more than 75 numeric fields.");
+                    }
+                }
+            }
+        }
+
+        if (!record.isEmpty() || rows.isEmpty()) {
+            throw new IOException("The raw file has an incomplete record or no records.");
+        }
+        return rows;
+    }
+
+    // Use medians for continuous features and modes for categorical features.
+    private static void fillMissingValues(List<double[]> rows) throws IOException {
+        for (int column : CONTINUOUS_COLUMNS) {
+            fillWithMedian(rows, column);
+        }
+        for (int column : CATEGORICAL_COLUMNS) {
+            fillWithMode(rows, column);
+        }
+    }
+
+    // Find a column's median and use it to replace missing values.
+    private static void fillWithMedian(List<double[]> rows, int column) throws IOException {
+        double[] values = new double[rows.size()];
+        int count = 0;
+        for (double[] row : rows) {
+            if (!Double.isNaN(row[column])) {
+                values[count++] = row[column];
+            }
+        }
+        if (count == 0) {
+            throw new IOException("No observed values for " + column + " to calculate a median.");
+        }
+
+        Arrays.sort(values, 0, count);
+        double median;
+        if (count % 2 == 1) {
+            median = values[count / 2];
+        } else {
+            median = (values[count / 2 - 1] + values[count / 2]) / 2.0;
+        }
+        replaceMissingValues(rows, column, median);
+    }
+
+    // Find a column's most common value and use it for missing entries.
+    private static void fillWithMode(List<double[]> rows, int column) throws IOException {
+        double mode = Double.NaN;
+        int highestCount = 0;
+
+        for (double[] candidateRow : rows) {
+            double candidate = candidateRow[column];
+            if (Double.isNaN(candidate)) {
+                continue;
+            }
+
+            int count = 0;
+            for (double[] row : rows) {
+                if (row[column] == candidate) {
+                    count++;
+                }
+            }
+            if (count > highestCount) {
+                mode = candidate;
+                highestCount = count;
+            }
+        }
+        if (highestCount == 0) {
+            throw new IOException("No observed values for " + column + " to calculate a mode.");
+        }
+        replaceMissingValues(rows, column, mode);
+    }
+
+    // Replace missing values in the selected column.
+    private static void replaceMissingValues(List<double[]> rows, int column, double value) {
+        for (double[] row : rows) {
+            if (Double.isNaN(row[column])) {
+                row[column] = value;
+            }
+        }
+    }
+
+    // Write a CSV row for each patient, including target (0 or 1).
+    private static void writeRows(Path output, List<double[]> rows) throws IOException {
+        Path parent = output.toAbsolutePath().normalize().getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+
+        try (BufferedWriter writer = Files.newBufferedWriter(output, StandardCharsets.UTF_8)) {
+            writer.write(HEADER);
+            writer.newLine();
+
+            for (double[] row : rows) {
+                for (int column = 0; column < row.length; column++) {
+                    if (column > 0) {
+                        writer.write(",");
+                    }
+                    if (column == 13) {
+                        writer.write(Integer.toString((int) row[column]));
+                    } else {
+                        writer.write(Double.toString(row[column]));
+                    }
+                }
+                writer.write(row[13] == 0 ? ",0" : ",1");
+                writer.newLine();
+            }
+        }
+    }
+}
